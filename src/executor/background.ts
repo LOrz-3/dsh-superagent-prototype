@@ -5,6 +5,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import { combineStopFailures } from './stop-failure.ts'
 
 /** What the Executor uses of DSH's job registry: the jobs a Session can see, their events, a wait for one and a kill. */
 interface Jobs {
@@ -15,9 +16,8 @@ interface Jobs {
 }
 /** What the Executor uses of DSH's subagents: joining a worker's subagents that work, its subagents, and releasing them. */
 interface Subagents {
-  waitForChildren(parent: Agent): Promise<boolean>
-  listChildren(parentSessionId: string): Promise<readonly { id: string }[]>
-  drainChildren(parent: Agent, childIds: readonly string[]): Promise<void>
+  waitForTreeWork(parent: Agent): Promise<boolean>
+  stopDescendants(parents: readonly Agent[]): Promise<void>
 }
 /** How long a stop waits for a killed job to end, collecting its end so the worker is not woken to hear of it. */
 const KILL_WAIT_MS = 10_000
@@ -27,7 +27,13 @@ const DRAIN_LIMIT_MS = 10_000
 const COLLECT_WAIT_MS = 10 * 60_000
 
 const registry = (ctx: Context): Jobs | undefined => ctx.get('jobs') as Jobs | undefined
-const subagentsOf = (ctx: Context): Subagents | undefined => ctx.get('subagents') as Subagents | undefined
+const subagentsOf = (ctx: Context): Subagents | undefined => {
+  const service = ctx.get('subagents') as Subagents | undefined
+  if (service && (typeof service.waitForTreeWork !== 'function' || typeof service.stopDescendants !== 'function')) {
+    throw new Error('DSH subagents requires waitForTreeWork and reusable stopDescendants; load the matching lifecycle runtime extension')
+  }
+  return service
+}
 const running = (status: string) => status === 'running' || status === 'stopping'
 /** The jobs the Session owns that run, but those in `except`, such as the ones left to a person. */
 const owned = (jobs: Jobs, sessionId: string, except?: ReadonlySet<string>) =>
@@ -42,14 +48,12 @@ export function until<T>(work: Promise<T>, signal?: AbortSignal, ms?: number): P
   timer?.unref?.()
   return Promise.race([work, stopped]).finally(() => { signal?.removeEventListener('abort', stop); clearTimeout(timer) })
 }
-/** The workers whose turn a stop of their subagents cancelled, whose next idle ends that turn rather than one of their own. */
-export const cancelled = new WeakSet<Agent>()
 /** The pending join of each worker's subagents, which DSH cannot cancel, so a later look joins the same one. */
 const joins = new WeakMap<Agent, Promise<boolean>>()
 function childrenEnd(subagents: Subagents, agent: Agent): Promise<boolean> {
   let join = joins.get(agent)
   if (!join) {
-    join = subagents.waitForChildren(agent).finally(() => { joins.delete(agent) })
+    join = subagents.waitForTreeWork(agent).finally(() => { joins.delete(agent) })
     joins.set(agent, join)
   }
   return join
@@ -112,7 +116,12 @@ export async function killJobs(ctx: Context, sessionId: string, reason: string, 
   const live = jobs ? owned(jobs, sessionId, except) : []
   const failures: unknown[] = []
   // The waits start before the kills, so each end counts as collected.
-  const collected = live.map(job => jobs!.wait(job.id, KILL_WAIT_MS, sessionId).catch(() => undefined))
+  const collected = live.map(async job => {
+    try {
+      const view = await jobs!.wait(job.id, KILL_WAIT_MS, sessionId)
+      if (running(view.status)) throw new Error(`Shell job ${job.id} of ${sessionId} did not stop within ${KILL_WAIT_MS}ms`)
+    } catch (error) { failures.push(error) }
+  })
   for (const job of live) try { jobs!.kill(job.id, sessionId, reason) } catch (error) { failures.push(error) }
   await Promise.all(collected)
   if (failures.length) throw new AggregateError(failures, `Killing the shell jobs of ${sessionId} failed`)
@@ -134,21 +143,15 @@ export async function collectJob(ctx: Context, sessionId: string, job: { id: str
 }
 
 /**
- * Release the worker's live subagents, for a bounded time. DSH delivers each one's end to the worker before the release
- * returns, which wakes it, so the worker's turn is cancelled after, keeping its inbox when `keepInbox`, and the stop ends
- * with that turn. Its Session still admits subagents.
+ * Release the worker's current descendant tree, including admitted startup, without ending root residency.
+ * DSH injects teardown notices without waking the root and reopens admission only after successful cleanup.
+ * A timeout is a failure, not evidence of completion; DSH's cleanup and admission barrier remain active.
  */
-export async function stopSubagents(ctx: Context, agent: Agent, keepInbox = false): Promise<void> {
+export async function stopSubagents(ctx: Context, agent: Agent, _keepInbox = false): Promise<void> {
   const subagents = subagentsOf(ctx)
   if (!subagents) return
-  // The catalog lists every subagent the Session had; one that ended has no agent.
-  const live = (await subagents.listChildren(agent.id)).map(child => child.id).filter(id => ctx.agents.get(id as SessionId))
-  if (!live.length) return
-  try { await until(subagents.drainChildren(agent, live), undefined, DRAIN_LIMIT_MS) }
-  finally {
-    if (agent.status !== 'idle') cancelled.add(agent)
-    agent.cancel({ kind: 'user' }, { keepInbox })
-    await until(agent.whenIdle(), undefined, DRAIN_LIMIT_MS)
+  if (await until(subagents.stopDescendants([agent]), undefined, DRAIN_LIMIT_MS) === false) {
+    throw new Error(`Stopping the subagents of ${agent.id} timed out after ${DRAIN_LIMIT_MS}ms`)
   }
 }
 
@@ -159,7 +162,7 @@ export async function stopSubagents(ctx: Context, agent: Agent, keepInbox = fals
 export async function stopBackground(ctx: Context, sessionId: string, reason: string, keepInbox = false): Promise<void> {
   const failures: unknown[] = []
   await killJobs(ctx, sessionId, reason).catch((error: unknown) => { failures.push(error) })
-  const agent = ctx.agents.get(sessionId as SessionId)
+  const agent = ctx.get('agents')!.get(sessionId as SessionId)
   if (agent) await stopSubagents(ctx, agent, keepInbox).catch((error: unknown) => { failures.push(error) })
-  if (failures.length) throw new AggregateError(failures, `Stopping the background work of ${sessionId} failed`)
+  if (failures.length) throw combineStopFailures(failures, `Stopping the background work of ${sessionId} failed`)
 }

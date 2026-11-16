@@ -32,7 +32,7 @@ flowchart TB
 
 Startup registers management routes and runs Setup. After setup resolves, it installs Session and Executor hooks, ensures the main Session exists, starts Policy syncs, resumes interrupted Assignments, and starts passes and effects. `ready` marks completion of startup.
 
-Shutdown cancels turns, waits for passes, effects and agents, restores the process environment, closes the Store and releases the lock. Source plugins inject Runtime as the `orchestrator` service through the narrow `SourceHost` interface.
+Shutdown first confirms that turns, passes, effects and background work are quiescent. Closing guards deny new managed work; unverified cleanup retains the Store, directory lock and Agent-owned guards. Concurrent stops share one attempt, and a later attempt observes the same finalization receipt after a timeout without replaying opaque disposers. Confirmed finalization restores the environment and closes the Store before releasing the guards and lock; a failed close retains the lock. Source plugins inject Runtime as the `orchestrator` service through the narrow `SourceHost` interface.
 
 | Part | Module | Does |
 | --- | --- | --- |
@@ -352,8 +352,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/settings.ts` | The settings page's view: each block with its revision, each Source's settings with its kind's form, and the execution environment |
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
-| `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
-| `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
+| `src/executor/background.ts` | Worker jobs and subagent trees: `runningJobs`, `untilQuiet`, `killJobs`, `collectJob`, `stopSubagents`, `stopBackground`, and `until`. Requires DSH `waitForTreeWork` and reusable `stopDescendants`; cleanup timeouts are failures |
+| `src/executor/worker-health.ts` | `WorkerHealth` and `workerError`: bounded nested failure details, secret redaction, and recovery only after the same cleanup succeeds; lost subagent results remain visible separately from cleanup failures |
+| `src/executor/stop-failure.ts` | Runtime-confirmed `ACTIVATION_RESULT_FAILED` permits later work after release; unknown cleanup failures still block delivery. Executor-owned aggregates preserve both classifications |
+| `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` preserves confirmed local termination before remote diagnostics, so a killed or truncated command cannot claim an HTTP/API status. For local termination, JSON diagnostics expose only `error.message`; stdout, generic execution messages and other JSON payload fields are omitted. `validItems` skips and counts malformed list items |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
@@ -412,7 +414,11 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
-| `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
+| `tests/worker-health.spec.ts` | Nested cleanup causes, redaction, scoped recovery, and stale concurrent attempts |
+| `tests/background.spec.ts` | Worker idle waits, reusable descendant stopping, timeout/failure propagation, and preservation of released-resource result failures |
+| `tests/transient.spec.ts` | Current SDK failure facts, the two observed PI stream interruptions, and explicit refusal/cancellation precedence |
+| `tests/command-error.spec.ts` | Local termination before remote codes, Abort identity, and bounded JSON diagnostics without extra request payload |
+| `tests/stop-failure.spec.ts` | Explicit runtime result codes, mixed cleanup errors, and refusal to infer release from nested causes |
 | `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the agent preset of Executor Sessions it defines |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
 | `tests/passes.spec.ts` | Passes: one at a time, the ones asked for during a pass run as one after it, and the runtime health a failed pass reports |
@@ -425,6 +431,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP |
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
+| `tests/runtime-shutdown.spec.ts` | Quiescence and finalizer receipts, safe stop retry, retained guards and Store lock, and failure aggregation |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
@@ -530,6 +537,8 @@ Each Executor has six application tools:
 A hand-back returns `queued: false` if another Ticket still owns the message, or this Ticket never owned it. For example, a bot message went to Eval independently.
 
 The worker preset is defined in `cordis.patch.yml` and selected through `WORKER_PRESET`. `WORK_TOOLS` in `src/app/sessions.ts` retains available file, search, shell, job, web, skill, todo and subagent tools. Workers do not receive tools for asking or presenting to a person, changing the profile, scheduling work outside worker slots, starting or messaging other Sessions, or editing external documents. Tool calls are refused after the Ticket ends.
+
+Worker turn recovery retains the existing three attempts and 15/30/60-second backoff. It reads the SDK's nested failure status and recognizes the two observed `PI_AI_ERROR` stream-interruption messages; explicit cancellation and non-retryable HTTP refusal take precedence. A ready, blocked, failed or question handoff cannot be resumed by an internal retry until a later input was actually delivered or a direct human turn was claimed. Queued human input alone does not prove delivery. Recovery continues in the same Session and preserves committed tool results; it does not promise globally exactly-once external effects.
 
 ### Result shapes and assessment context
 

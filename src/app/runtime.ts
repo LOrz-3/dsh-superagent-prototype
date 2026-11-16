@@ -21,6 +21,8 @@ import type { Deployment, Machine } from '../deployment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../executor/dsh.ts'
+import { killJobs, until } from '../executor/background.ts'
+import { workerError } from '../executor/worker-health.ts'
 import { ticketCard } from './cards.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
@@ -50,6 +52,7 @@ import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
 const now = (): string => new Date().toISOString()
+const SHUTDOWN_WAIT_MS = 10_000
 
 /**
  * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Sessions`, `Settings`, `Prompts`, `DshExecutor`, and `MasterAssessor`.
@@ -80,6 +83,11 @@ export class Runtime extends Service implements SourceHost {
   private releaseLock?: () => Promise<void>
   private closingFlag = false
   private stopping?: Promise<void>
+  private quiescent = false
+  private storeClosed = false
+  private finalization?: Promise<void>
+  private guardRelease?: Promise<void>
+  private unlocking?: Promise<void>
   private readonly sourceDeps: SourceContextDeps
   private readonly toolHost: MainToolsHost & ExecutorToolsHost
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
@@ -225,30 +233,81 @@ export class Runtime extends Service implements SourceHost {
       configured: () => setup.configured(), links: () => runtime.links(), ticketEnvironment: ticket => runtime.ticketEnvironment(ticket),
       checkSetup: () => { setup.check() }, requestPass: () => { passes.request() }, models: () => this.ctx.sessionController.modelCatalog() }
   }
-  /** Idempotent stop; concurrent or repeated calls share the same shutdown promise. */
-  stop(): Promise<void> { return this.stopping ??= this.shutdown() }
+  /** Concurrent stops share one attempt; rejection permits another cleanup confirmation. */
+  stop(): Promise<void> {
+    if (this.stopping) return this.stopping
+    const completion = Promise.withResolvers<void>()
+    const stopping = completion.promise
+    this.stopping = stopping
+    void this.shutdown().then(completion.resolve, (failure: unknown) => {
+      let error = failure
+      try { this.runtimeHealth.set({ state: 'error', detail: `Shutdown remains incomplete: ${workerError(error)}`, at: now() }) }
+      catch (reportError: unknown) { error = new AggregateError([failure, reportError], 'Shutdown and failure reporting failed') }
+      completion.reject(error)
+      if (this.stopping === stopping) this.stopping = undefined
+    })
+    return stopping
+  }
   private async shutdown(): Promise<void> {
-    this.closingFlag = true; const passes = this.passes.stop(); this.stopped.abort()
-    try {
-      this.assessor.stop()
-      const ids = [this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]
-      const agents = ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
-      for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
-      await Promise.allSettled([passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
-      // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.
-      await this.executor.shutdown()
-      this.executor.dispose()
-      this.sessions.dispose()
-      for (const dispose of this.disposers.reverse()) dispose()
-      await this.ctx.sessionPersistence.flush()
-    } finally {
-      // Close the database before releasing the directory lock so another process cannot open the database mid-write; a compromised lock may already be released.
-      this.setup.restore()
-      try { this.store.close() } finally {
-        const unreleased = (error: unknown) => { this.ctx.logger.warn('dsh-superagent could not release its state directory lock: %s',
-          String(error)) }
-        await this.releaseLock?.().catch(unreleased)
-      }
+    this.closingFlag = true; this.stopped.abort()
+    const failures: unknown[] = []
+    const bounded = async (work: unknown, label: string) => {
+      if (await until(Promise.resolve(work).then(() => true), undefined, SHUTDOWN_WAIT_MS) === false) throw new Error(`${label} did not settle during shutdown`)
+    }
+    const attempt = async (run: () => unknown) => {
+      try { await run() } catch (error: unknown) { failures.push(error) }
+    }
+    const reject = () => { if (failures.length) throw new AggregateError(failures, 'dsh-superagent shutdown failed') }
+    if (!this.quiescent) {
+      await Promise.all([
+        attempt(() => bounded(this.passes.stop(), 'Pass draining')), attempt(() => this.assessor.stop()),
+        attempt(() => bounded(this.effects.drain(), 'Effect draining')),
+        attempt(async () => {
+          // Initialization errors remain observable through ready; join settlement to prevent late publication.
+          if (await until(Promise.allSettled([this.ready]), undefined, SHUTDOWN_WAIT_MS) === false) throw new Error('Initialization did not settle before shutdown')
+        }),
+      ])
+      let agents: Agent[] = []
+      await attempt(() => {
+        const ids = [this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]
+        agents = ids.map(id => this.ctx.get('agents')!.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
+      })
+      for (const agent of agents) await attempt(() => agent.cancel({ kind: 'user' }, { keepInbox: true }))
+      await Promise.all([
+        ...agents.map(agent => attempt(async () => {
+          if (await until(agent.whenIdle(), undefined, SHUTDOWN_WAIT_MS) === false) throw new Error(`Agent ${agent.id} did not reach idle during shutdown`)
+        })),
+        attempt(() => this.executor.shutdown()),
+        attempt(() => killJobs(this.ctx, this.masterId, 'dsh-superagent stopped')),
+      ])
+      reject()
+      this.quiescent = true
+    }
+    if (!this.storeClosed) {
+      this.finalization ??= (async () => {
+        const rejected: unknown[] = []
+        const finalize = async (run: () => unknown) => {
+          try { await run() } catch (error: unknown) { rejected.push(error) }
+        }
+        await finalize(() => this.executor.dispose())
+        await finalize(() => this.sessions.dispose(true))
+        for (const dispose of this.disposers.splice(0).reverse()) await finalize(dispose)
+        await finalize(() => this.setup.restore())
+        if (rejected.length) throw new AggregateError(rejected, 'Application finalizers failed')
+      })()
+      await attempt(() => bounded(this.finalization, 'Application finalization'))
+      await attempt(() => bounded(this.ctx.get('sessionPersistence')!.flush(), 'Session persistence flush'))
+      reject()
+      this.store.close()
+      this.storeClosed = true
+    }
+    this.guardRelease ??= this.sessions.releaseGuards()
+    await attempt(() => bounded(this.guardRelease, 'Agent guard release'))
+    reject()
+    if (this.releaseLock) {
+      this.unlocking ??= Promise.resolve().then(() => this.releaseLock!())
+      await bounded(this.unlocking, 'State directory lock release')
+      this.releaseLock = undefined
     }
   }
 }

@@ -32,6 +32,7 @@ type RegisteredTool = { name: string; execute: (args: unknown, execution: { sign
 type FakeAgent = {
   id: string; status: string; inbox: { nextTurn: UserMessage[]; nextStep: UserMessage[] }
   cancel: Mock; inject: Mock<(message: UserMessage) => void>; steer: Mock<(message: UserMessage) => void>; followup: Mock<(message: UserMessage) => void>
+  whenIdle(): Promise<void>
 }
 /** A text message, as DSH's job tools and subagents send their notices. */
 const notice = (id: string, text: string) => ({ id, role: 'user', content: [{ type: 'text', text }], source: { kind: 'tool-jobs', form: 'notice' } }) as unknown as UserMessage
@@ -105,14 +106,21 @@ export function subagentRuntime(agents: Map<string, FakeAgent>) {
     else parent?.steer(ended)
     child.settled.resolve()
   }
+  const belongs = (id: string, root: string): boolean => {
+    const parent = children.get(id)?.parent
+    return parent !== undefined && (parent === root || belongs(parent, root))
+  }
   const service = {
-    waitForChildren: vi.fn(async (parent: { id: string }) => {
-      const live = [...children.values()].filter(child => child.parent === parent.id && child.live)
+    waitForTreeWork: vi.fn(async (parent: { id: string }) => {
+      const live = [...children].filter(([id, child]) => belongs(id, parent.id) && child.live).map(([, child]) => child)
       await Promise.all(live.map(child => child.settled.promise))
       return live.length > 0
     }),
-    listChildren: vi.fn(async (id: string) => [...children].filter(([, child]) => child.parent === id).map(([childId]) => ({ id: childId }))),
-    drainChildren: vi.fn(async (_parent: { id: string }, ids: readonly string[]) => { for (const id of ids) settle(id) }),
+    stopDescendants: vi.fn(async (parents: readonly { id: string }[]) => {
+      for (const parent of parents) {
+        for (const [id] of children) if (belongs(id, parent.id)) settle(id, false)
+      }
+    }),
     drainDescendants: vi.fn(async (parents: readonly { id: string }[]) => {
       for (const parent of parents) {
         closed.add(parent.id)

@@ -21,8 +21,22 @@ export function commandError(error: unknown, program = 'command'): Error {
   if (error && typeof error === 'object' && 'stderr' in error && typeof error.stderr === 'string') {
     const stderr = error.stderr.trim()
     let parsed: { error?: { code?: number; message?: string } } | undefined
-    try { parsed = JSON.parse(stderr.slice(stderr.indexOf('{'))) as typeof parsed }
-    catch { /* Non-JSON CLI diagnostics are retained below. */ }
+    let json = false
+    try { parsed = JSON.parse(stderr) as typeof parsed; json = true }
+    catch {
+      const objectStart = stderr.indexOf('{')
+      if (objectStart >= 0) {
+        try { parsed = JSON.parse(stderr.slice(objectStart)) as typeof parsed; json = true }
+        catch { /* Non-JSON CLI diagnostics are retained below. */ }
+      }
+    }
+    const terminated = ('killed' in error && error.killed === true)
+      || ('signal' in error && typeof error.signal === 'string' && error.signal.length > 0)
+      || ('code' in error && error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER')
+    if (terminated) {
+      const detail = json ? typeof parsed?.error?.message === 'string' ? parsed.error.message : '' : stderr
+      return new CliError(`${basename(program)} ${ended(error)}${detail ? `; stderr: ${detail.slice(0, 2000)}` : ''}`, undefined, exitCode)
+    }
     const code = parsed?.error?.code
     if (parsed?.error?.message) return new CliError(`${parsed.error.message}${code ? ` (${code})` : ''}`, code, exitCode)
     // `gh` exits non-zero on HTTP errors (such as `gh: Not Found (HTTP 404)`) and on `gh: HTTP 304`, which ETag polling relies on.
@@ -36,6 +50,7 @@ function ended(error: unknown): string {
   // `execFile` timeout terminates the process with SIGTERM and sets `killed: true`.
   if (killed && signal === 'SIGTERM') return `timed out after ${TIMEOUT_MS / 1000} s`
   if (signal) return `was stopped by ${signal}`
+  if (killed === true) return 'was terminated'
   if (typeof code === 'number') return `exited with code ${code}`
   return typeof code === 'string' ? `could not run: ${code}` : 'failed'
 }
