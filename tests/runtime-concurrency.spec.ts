@@ -1,5 +1,7 @@
 /** Concurrent runtime behavior across overlapping triggers, deliveries, and worker launches. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { LlmError } from '@deepseek-ai/dsh-llm'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import { latestAssignment, waitsForPerson, type Ticket, type Trigger } from '../src/core/index.ts'
 import { Later } from '../src/app/effects.ts'
 import { reportRelay } from '../src/app/notices.ts'
@@ -79,6 +81,44 @@ it('drops a delivery whose ticket a person stopped while it waited for the worke
   gate.resolve(); await resumed; await h.runtime.idle()
   expect(h.deliveries.mock.calls.slice(before).map(([call]) => call.sessionId)).not.toContain(one.sessionId)
   expect(h.runtime.store.tickets.get(one.ticket.id)).not.toHaveProperty('delivery')
+})
+
+it.each(['pending', 'failed'] as const)('does not launch when cleanup becomes %s during final Session resolution', async cleanupState => {
+  const entered = deferred(), session = deferred(), cleanup = deferred()
+  const prompt = h.runtime.sessions.prompt.bind(h.runtime.sessions)
+  vi.spyOn(h.runtime.sessions, 'prompt').mockImplementation(async (...args) => {
+    if (args[0].startsWith('worker-') && args[1].startsWith('assignment:')) {
+      entered.resolve(); await session.promise
+    }
+    return prompt(...args)
+  })
+  const trigger = feishu('1', '@bot 修一')
+  h.runtime.receive(trigger); await h.runtime.idle()
+  const accepted = await h.route({ kind: 'accept', trigger_id: trigger.id, title: 'Fix', worktree_name: 'fix-race', acknowledgement: '收到。' })
+  await entered.promise
+  const ticketId = (accepted.ticket as { ticket_id: string }).ticket_id
+  const ticket = h.runtime.store.tickets.get(ticketId)!, assignment = latestAssignment(ticket)!
+  const sessionId = `worker-${ticketId}`
+  h.subagents.service.stopDescendants.mockImplementationOnce(async () => { await cleanup.promise })
+  // This stop starts after launch's first barrier check, while final Session delivery is unresolved.
+  h.runtime.executor.stop(ticket, assignment, 'Overlapping background cleanup')
+  await vi.waitFor(() => expect(h.subagents.service.stopDescendants).toHaveBeenCalled())
+  if (cleanupState === 'failed') {
+    cleanup.reject(new Error('unconfirmed resource'))
+    await vi.waitFor(() => expect(h.runtime.health.worker?.state).toBe('error'))
+  }
+  session.resolve(); await h.runtime.idle()
+  expect(h.deliveries.mock.calls.filter(([call]) => call.sessionId === sessionId)).toEqual([])
+  if (cleanupState === 'pending') {
+    expect(latestAssignment(h.runtime.store.tickets.get(ticketId)!)?.state).toBe('pending')
+    cleanup.resolve()
+    vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 6000 })
+    try { await h.runtime.pump(); await h.runtime.idle() } finally { vi.useRealTimers() }
+    expect(latestAssignment(h.runtime.store.tickets.get(ticketId)!)?.state).toBe('running')
+    expect(h.deliveries.mock.calls.some(([call]) => call.sessionId === sessionId)).toBe(true)
+  } else {
+    expect(h.runtime.health.worker?.detail).toContain('unconfirmed resource')
+  }
 })
 
 it('runs prepare commands in the background, side by side, while accepts, intake and passes go on', async () => {
@@ -211,6 +251,207 @@ describe('a worker that goes on after a passing failure', () => {
   const busy = () => Object.assign(new Error('Service Unavailable'), { status: 503 })
   const told = (sessionId: string) => h.deliveries.mock.calls.map(([call]) => call)
     .filter(call => call.sessionId === sessionId && call.text.includes('Your last turn failed for a passing reason'))
+  const reportHandoff = async (sessionId: string, kind: 'blocked' | 'failed' | 'ready' | 'attention') => {
+    await h.runTool(sessionId, 'orchestrator_report', kind === 'attention'
+      ? { state: 'progress', summary: 'Need a decision', human_action: 'Which option?' }
+      : { state: kind, summary: 'Handoff is complete' })
+  }
+  it.each(['Upstream HTTP/2 stream failed', 'Upstream response stream was interrupted'])('keeps the third host continuation after SDK retries for %s, then stops at three', async message => {
+    const one = await h.acceptedTicket(feishu('1', '@bot observed transport'))
+    const agent = h.agents.get(one.sessionId)!
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const session = h.ctx.get('agents')!.get(SessionId(one.sessionId))!.session
+        for (let retry = 1; retry <= 5; retry++) h.ctx.emit('session/event', session, {
+          type: 'llm/retry', seq: 1000 + attempt * 10 + retry, time: Date.now(),
+          data: { retryId: `sdk-${attempt}`, turn: 1, step: attempt + 1, provider: 'weinexus', mode: 'normal',
+            retry, maxRetries: 5, delayMs: 500, failure: { message: '502 unavailable', code: 'SERVER' } },
+        } as never)
+        const error = attempt < 2 ? new LlmError('Provider unavailable', 'SERVER', { status: 502 }) : new LlmError(message, 'PI_AI_ERROR')
+        h.ctx.emit('agent/error', { agent, turn: attempt + 1, step: 1, error } as never)
+        await vi.advanceTimersByTimeAsync(15_000 * 2 ** attempt)
+        expect(told(one.sessionId)).toHaveLength(attempt + 1)
+        expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toBeUndefined()
+      }
+      h.ctx.emit('agent/error', { agent, turn: 4, step: 1, error: new LlmError(message, 'PI_AI_ERROR') } as never)
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(told(one.sessionId)).toHaveLength(3)
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toMatchObject({ state: 'failed', summary: expect.stringContaining(message) })
+    } finally { vi.useRealTimers() }
+  })
+  it.each(['blocked', 'failed', 'ready', 'attention'] as const)('does not continue or overwrite %s without a later input', async kind => {
+    const one = await h.acceptedTicket(feishu('1', '@bot handoff error'))
+    h.runtime.engine.bindThread(one.ticket.id, { source: 'github', id: '7' }, true)
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'], now: Date.now() + 1000 })
+    try {
+      await reportHandoff(one.sessionId, kind)
+      const report = latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!.report
+      h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 1, step: 1, error: busy() } as never)
+      idle(one.sessionId)
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(told(one.sessionId)).toEqual([])
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toEqual(report)
+    } finally { vi.useRealTimers() }
+  })
+  it.each(['blocked', 'failed', 'ready', 'attention'] as const)('continues an unfinished turn after actual new human input following %s', async kind => {
+    const one = await h.acceptedTicket(feishu('1', '@bot new human'))
+    h.runtime.engine.bindThread(one.ticket.id, { source: 'github', id: '7' }, true)
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'], now: Date.now() + 1000 })
+    try {
+      await reportHandoff(one.sessionId, kind)
+      vi.setSystemTime(Date.now() + 1000)
+      h.runtime.receive(feishu('2', '继续处理', { mentions: [], root_id: 'om_1' })); await h.runtime.idle()
+      const assignment = latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!
+      expect(assignment.deliveredAt! > assignment.report!.at).toBe(true)
+      h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 2, step: 1, error: busy() } as never)
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(told(one.sessionId)).toHaveLength(1)
+    } finally { vi.useRealTimers() }
+  })
+  it.each(['blocked', 'ready', 'attention'] as const)('cancels a backoff after later %s and still performs the idle handoff', async kind => {
+    const one = await h.acceptedTicket(feishu('1', '@bot backoff handoff'))
+    h.runtime.engine.bindThread(one.ticket.id, { source: 'github', id: '7' }, true)
+    const child = h.subagents.spawn(one.sessionId)
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'], now: Date.now() + 1000 })
+    try {
+      h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 1, step: 1, error: busy() } as never)
+      await vi.advanceTimersByTimeAsync(5000)
+      await reportHandoff(one.sessionId, kind)
+      const report = latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!.report
+      idle(one.sessionId); await vi.advanceTimersByTimeAsync(0)
+      expect(h.subagents.live(child)).toBe(false)
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.idleAt).toBeDefined()
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(told(one.sessionId)).toEqual([])
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toEqual(report)
+    } finally { vi.useRealTimers() }
+  })
+  it.each(['blocked', 'ready', 'attention'] as const)('rechecks a %s handoff at final Session acceptance and replays a skipped idle', async kind => {
+    const one = await h.acceptedTicket(feishu('1', '@bot final handoff'))
+    h.runtime.engine.bindThread(one.ticket.id, { source: 'github', id: '7' }, true)
+    const gate = deferred(), held = holdSession(one.sessionId, gate.promise)
+    const child = h.subagents.spawn(one.sessionId)
+    h.agents.get(one.sessionId)!.status = 'idle'
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'], now: Date.now() + 1000 })
+    try {
+      h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 1, step: 1, error: busy() } as never)
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(held()).toBe(true)
+      await reportHandoff(one.sessionId, kind)
+      const report = latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!.report
+      gate.resolve(); await vi.advanceTimersByTimeAsync(1)
+      expect(told(one.sessionId)).toEqual([])
+      expect(h.subagents.live(child)).toBe(false)
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.idleAt).toBeDefined()
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(told(one.sessionId)).toEqual([])
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toEqual(report)
+    } finally { gate.resolve(); vi.useRealTimers() }
+  })
+  it.each(['blocked', 'failed'] as const)('holds %s while human input is queued, then permits recovery after delivery', async kind => {
+    const one = await h.acceptedTicket(feishu('1', '@bot queued human'))
+    const gate = deferred(), held = holdSession(one.sessionId, gate.promise)
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'], now: Date.now() + 1000 })
+    try {
+      await reportHandoff(one.sessionId, kind)
+      const initial = h.runtime.store.tickets.get(one.ticket.id)!, report = latestAssignment(initial)!.report!
+      latestAssignment(initial)!.deliveredAt = report.at; h.runtime.store.tickets.save(initial)
+      vi.setSystemTime(Date.now() + 1000)
+      h.runtime.receive(feishu('2', '继续处理', { mentions: [], root_id: 'om_1' }))
+      await vi.waitFor(() => expect(held()).toBe(true))
+      const queued = h.runtime.store.tickets.get(one.ticket.id)!
+      expect(waitsForPerson(queued)).toBe(false)
+      expect(queued.undelivered).toHaveLength(1)
+      expect(latestAssignment(queued)?.deliveredAt).toBe(report.at)
+      h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 1, step: 1, error: busy() } as never)
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(told(one.sessionId)).toEqual([])
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toEqual(report)
+      gate.resolve(); await h.runtime.idle()
+      const delivered = latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!
+      expect(delivered.deliveredAt! > report.at).toBe(true)
+      h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 2, step: 1, error: busy() } as never)
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(told(one.sessionId)).toHaveLength(1)
+    } finally { gate.resolve(); vi.useRealTimers() }
+  })
+  it.each(['blocked', 'failed'] as const)('rejects a %s queued-human race at final retry acceptance', async kind => {
+    const one = await h.acceptedTicket(feishu('1', '@bot queued final race'))
+    const retry = deferred(), human = deferred()
+    let calls = 0
+    h.controller.resolveAgent.mockImplementation(async (id: string) => {
+      if (id === one.sessionId) { calls++; if (calls === 1) await retry.promise; else if (calls === 2) await human.promise }
+      return h.resolveDefault(id)
+    })
+    h.agents.get(one.sessionId)!.status = 'idle'
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'], now: Date.now() + 1000 })
+    try {
+      h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 1, step: 1, error: busy() } as never)
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(calls).toBe(1)
+      await reportHandoff(one.sessionId, kind)
+      const beforeHuman = h.runtime.store.tickets.get(one.ticket.id)!, report = latestAssignment(beforeHuman)!.report!
+      latestAssignment(beforeHuman)!.deliveredAt = report.at; h.runtime.store.tickets.save(beforeHuman)
+      vi.setSystemTime(Date.now() + 1000)
+      h.runtime.receive(feishu('2', '继续处理', { mentions: [], root_id: 'om_1' }))
+      await vi.waitFor(() => expect(calls).toBe(2))
+      const queued = h.runtime.store.tickets.get(one.ticket.id)!
+      expect(waitsForPerson(queued)).toBe(false)
+      expect(queued.undelivered).toHaveLength(1)
+      expect(latestAssignment(queued)!.deliveredAt! <= report.at).toBe(true)
+      retry.resolve(); await vi.advanceTimersByTimeAsync(1)
+      expect(told(one.sessionId)).toEqual([])
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toEqual(report)
+    } finally { retry.resolve(); human.resolve(); vi.useRealTimers(); await h.runtime.idle() }
+  })
+  it('does not revive an old cancelled retry when a new human turn arrives', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot stale cancelled retry'))
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'], now: Date.now() + 1000 })
+    try {
+      h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 1, step: 1, error: busy() } as never)
+      await reportHandoff(one.sessionId, 'blocked'); idle(one.sessionId); await vi.advanceTimersByTimeAsync(1)
+      vi.setSystemTime(Date.now() + 1000)
+      h.runtime.receive(feishu('2', '继续处理', { mentions: [], root_id: 'om_1' })); await h.runtime.idle()
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(told(one.sessionId)).toEqual([])
+      h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 2, step: 1, error: busy() } as never)
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(told(one.sessionId)).toHaveLength(1)
+    } finally { vi.useRealTimers() }
+  })
+  it.each(['blocked', 'failed', 'ready', 'attention'] as const)('allows a real direct human claim after %s without a new deliveredAt', async kind => {
+    const one = await h.acceptedTicket(feishu('1', '@bot direct human'))
+    h.runtime.engine.bindThread(one.ticket.id, { source: 'github', id: '7' }, true)
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'], now: Date.now() + 1000 })
+    try {
+      await reportHandoff(one.sessionId, kind)
+      vi.setSystemTime(Date.now() + 1000)
+      const agent = h.agents.get(one.sessionId)!
+      h.ctx.emit('agent/inbox/claimed', { agent, message: { source: { kind: 'user' } } } as never)
+      const assignment = latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!
+      expect(assignment.deliveredAt! > assignment.report!.at).toBe(false)
+      h.ctx.emit('agent/error', { agent, turn: 2, step: 1, error: busy() } as never)
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(told(one.sessionId)).toHaveLength(1)
+    } finally { vi.useRealTimers() }
+  })
+  it('does not keep rescheduling a paused retry after the assignment hands off', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot paused handoff'))
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'], now: Date.now() + 1000 })
+    try {
+      await h.runtime.settings.pause(true, 'panel')
+      h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 1, step: 1, error: busy() } as never)
+      await vi.advanceTimersByTimeAsync(15_000)
+      await reportHandoff(one.sessionId, 'attention'); idle(one.sessionId)
+      await vi.advanceTimersByTimeAsync(1)
+      const report = latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!.report
+      await h.runtime.settings.pause(false, 'panel')
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(told(one.sessionId)).toEqual([])
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toEqual(report)
+    } finally { vi.useRealTimers() }
+  })
   it('starts the count of passing failures again once its turn ends as turns do', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     const agent = h.agents.get(one.sessionId)!
@@ -241,6 +482,70 @@ describe('a worker that goes on after a passing failure', () => {
       await vi.advanceTimersByTimeAsync(5000)
     } finally { vi.useRealTimers() }
     expect(told(one.sessionId)).toHaveLength(1)
+  })
+  it.each(['pending', 'failed'] as const)('holds retry delivery for cleanup that is %s before its timer fires', async cleanupState => {
+    const one = await h.acceptedTicket(feishu('1', '@bot retry barrier'))
+    const ticket = h.runtime.store.tickets.get(one.ticket.id)!, assignment = latestAssignment(ticket)!, cleanup = deferred()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 1, step: 1, error: busy() } as never)
+      await vi.advanceTimersByTimeAsync(14_999)
+      h.subagents.service.stopDescendants.mockImplementationOnce(async () => { await cleanup.promise })
+      h.runtime.executor.stop(ticket, assignment, 'overlapping retry cleanup')
+      if (cleanupState === 'failed') cleanup.reject(new Error('retry cleanup unconfirmed'))
+      await vi.advanceTimersByTimeAsync(1)
+      expect(told(one.sessionId)).toEqual([])
+      if (cleanupState === 'pending') {
+        cleanup.resolve(); await vi.advanceTimersByTimeAsync(1)
+        expect(told(one.sessionId)).toHaveLength(1)
+      } else {
+        expect(latestAssignment(h.runtime.store.tickets.get(ticket.id)!)?.report).toMatchObject({ state: 'failed' })
+        expect(h.runtime.health.worker?.detail).toContain('retry cleanup unconfirmed')
+      }
+    } finally { cleanup.resolve(); vi.useRealTimers() }
+  })
+  it.each(['pending', 'failed'] as const)('rechecks %s cleanup at final retry Session acceptance', async cleanupState => {
+    const one = await h.acceptedTicket(feishu('1', '@bot final retry barrier'))
+    const ticket = h.runtime.store.tickets.get(one.ticket.id)!, assignment = latestAssignment(ticket)!
+    const session = deferred(), cleanup = deferred(), held = holdSession(one.sessionId, session.promise)
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 1, step: 1, error: busy() } as never)
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(held()).toBe(true)
+      h.subagents.service.stopDescendants.mockImplementationOnce(async () => { await cleanup.promise })
+      h.runtime.executor.stop(ticket, assignment, 'cleanup during retry resolution')
+      if (cleanupState === 'failed') cleanup.reject(new Error('final cleanup unconfirmed'))
+      await vi.advanceTimersByTimeAsync(0)
+      session.resolve(); await vi.advanceTimersByTimeAsync(1)
+      expect(told(one.sessionId)).toEqual([])
+      if (cleanupState === 'pending') {
+        cleanup.resolve(); await vi.advanceTimersByTimeAsync(5000)
+        expect(told(one.sessionId)).toHaveLength(1)
+      } else {
+        expect(h.runtime.health.worker?.detail).toContain('final cleanup unconfirmed')
+      }
+    } finally { session.resolve(); cleanup.resolve(); vi.useRealTimers() }
+  })
+  it('does not deliver an old retry or fail the new assignment after Session resolution overlaps replacement', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot stale retry'))
+    const session = deferred(), held = holdSession(one.sessionId, session.promise)
+    const assignment = latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 1, step: 1, error: busy() } as never)
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(held()).toBe(true)
+      h.runtime.engine.deliveryFailed(one.ticket.id, assignment.id, 'retry overlap')
+      h.runtime.engine.retryTicket(one.ticket.id)
+      await h.runtime.idle()
+      const replacement = latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!
+      expect(replacement.id).not.toBe(assignment.id)
+      session.resolve(); await vi.advanceTimersByTimeAsync(1)
+      expect(told(one.sessionId)).toEqual([])
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report).toBeUndefined()
+      expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.state).toBe('running')
+    } finally { session.resolve(); vi.useRealTimers() }
   })
   it('drops its timer when the host stops within the backoff', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
@@ -295,11 +600,10 @@ describe('a worker whose work runs in the background', () => {
     const job = h.jobs.run(one.sessionId), child = h.subagents.spawn(one.sessionId)
     h.runtime.engine.stopTicket(one.ticket.id)
     await vi.waitFor(() => expect(h.jobs.service.kill).toHaveBeenCalledWith(job, one.sessionId, expect.any(String)))
-    await vi.waitFor(() => expect(h.subagents.service.drainChildren).toHaveBeenCalledWith(agent, [child]))
-    // The kill's end released the stop's own wait, which is how DSH tells the worker's job tools it was collected; the
-    // released subagent's end, which DSH delivers before the release returns, is dropped with the turn it woke.
+    await vi.waitFor(() => expect(h.subagents.service.stopDescendants).toHaveBeenCalledWith([agent]))
     expect(h.jobs.released).toBe(1)
-    await vi.waitFor(() => expect(agent.cancel.mock.invocationCallOrder.at(-1)).toBeGreaterThan(h.subagents.service.drainChildren.mock.invocationCallOrder[0]!))
+    expect(h.subagents.live(child)).toBe(false)
+    expect(agent.followup).not.toHaveBeenCalledWith(expect.objectContaining({ id: `settled-${child}` }))
     expect(agent.cancel).toHaveBeenLastCalledWith({ kind: 'user' }, { keepInbox: false })
     // Its Session still admits subagents, as when the ticket resumes.
     expect(() => h.subagents.spawn(one.sessionId)).not.toThrow()
@@ -509,14 +813,14 @@ describe('a worker whose work runs in the background', () => {
     h.subagents.spawn(one.sessionId)
     await h.runTool(one.sessionId, 'orchestrator_report', { state: 'ready', summary: 'PR ready' }); await h.runtime.idle()
     // A person's message is on its way into the worker's Session, held there, as the worker hands off; the release is slow.
-    const session = deferred(), drain = deferred(), release = h.subagents.service.drainChildren.getMockImplementation()!
-    h.subagents.service.drainChildren.mockImplementationOnce(async (parent, ids) => { await drain.promise; await release(parent, ids) })
+    const session = deferred(), drain = deferred(), release = h.subagents.service.stopDescendants.getMockImplementation()!
+    h.subagents.service.stopDescendants.mockImplementationOnce(async (parents) => { await drain.promise; await release(parents) })
     await new Promise(resolve => setTimeout(resolve, 5))
     const held = holdSession(one.sessionId, session.promise)
     h.runtime.receive(feishu('2', '按钮再大一点', { mentions: [], root_id: 'om_1' }))
     await vi.waitFor(() => expect(held()).toBe(true))
     idle(one.sessionId)
-    await vi.waitFor(() => expect(h.subagents.service.drainChildren).toHaveBeenCalled())
+    await vi.waitFor(() => expect(h.subagents.service.stopDescendants).toHaveBeenCalled())
     session.resolve()
     await new Promise(resolve => setTimeout(resolve, 20))
     drain.resolve()
@@ -524,7 +828,8 @@ describe('a worker whose work runs in the background', () => {
     const message = expect.objectContaining({ sessionId: one.sessionId, text: expect.stringContaining('按钮再大一点') })
     await vi.waitFor(() => expect(h.deliveries).toHaveBeenCalledWith(message), { timeout: 5000 })
     const delivered = h.deliveries.mock.calls.findIndex(([call]) => call.sessionId === one.sessionId && call.text.includes('按钮再大一点'))
-    expect(h.deliveries.mock.invocationCallOrder[delivered]).toBeGreaterThan(agent.cancel.mock.invocationCallOrder.at(-1)!)
+    expect(h.deliveries.mock.invocationCallOrder[delivered]).toBeGreaterThan(h.subagents.service.stopDescendants.mock.invocationCallOrder[0]!)
+    expect(agent.cancel).not.toHaveBeenCalled()
   })
   it('keeps an Input a restart found handed over to a settled worker, and delivers a waiting one once its subagents stopped', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
@@ -533,8 +838,8 @@ describe('a worker whose work runs in the background', () => {
     await vi.waitFor(() => expect(latestAssignment(ticket())?.report?.state).toBe('waiting'))
     // A subagent still runs, whose release is slow; one Input waits in the Session's inbox, another in the ticket.
     h.subagents.spawn(one.sessionId)
-    const gate = deferred(), drain = h.subagents.service.drainChildren.getMockImplementation()!
-    h.subagents.service.drainChildren.mockImplementationOnce(async (parent, ids) => { await gate.promise; await drain(parent, ids) })
+    const gate = deferred(), drain = h.subagents.service.stopDescendants.getMockImplementation()!
+    h.subagents.service.stopDescendants.mockImplementationOnce(async (parents) => { await gate.promise; await drain(parents) })
     agent.inbox.nextStep.push({ id: 'taken-later', role: 'user', content: [{ type: 'text', text: 'Handed over' }], source: { kind: 'user' } } as never)
     const stored = ticket()
     stored.inputs.push({ id: 'input-late', kind: 'text', text: 'One more thing', at: new Date().toISOString() })
@@ -570,6 +875,86 @@ describe('a worker whose work runs in the background', () => {
     expect(agent.followup.mock.calls.length).toBe(woken)
     expect(agent.status).toBe('idle')
   })
+  it('keeps released subagent result failures visible while the same worker accepts inputs and launches again', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const agent = h.agents.get(one.sessionId)!, child = h.subagents.spawn(one.sessionId)
+    const result = Object.assign(new Error('provider result unavailable token=private'), { code: 'ACTIVATION_RESULT_FAILED' })
+    h.subagents.service.stopDescendants.mockImplementationOnce(async () => { h.subagents.settle(child, false); throw result })
+    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'blocked', summary: 'Need input' })
+    idle(one.sessionId)
+    await vi.waitFor(() => expect(h.runtime.health.worker).toMatchObject({ state: 'error', detail: expect.stringContaining(`result:${one.ticket.id}`) }))
+    expect(h.runtime.health.worker?.detail).not.toContain('token=private')
+    expect(h.runtime.health.worker?.detail).not.toContain(`cleanup:${one.ticket.id}`)
+    h.runtime.receive(feishu('2', '继续处理', { mentions: [], root_id: 'om_1' })); await h.runtime.idle()
+    expect(h.deliveries).toHaveBeenCalledWith(expect.objectContaining({ sessionId: one.sessionId, text: expect.stringContaining('继续处理') }))
+    expect(h.agents.get(one.sessionId)).toBe(agent)
+    expect(() => h.subagents.spawn(one.sessionId)).not.toThrow()
+    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'blocked', summary: 'Ready for an explicit retry' })
+    h.runtime.engine.retryTicket(one.ticket.id); await h.runtime.idle()
+    expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.state).toBe('running')
+    expect(h.agents.get(one.sessionId)).toBe(agent)
+    expect(h.runtime.health.worker?.detail).toContain('provider result unavailable')
+    expect(h.runtime.health.worker?.detail).not.toContain(`cleanup:${one.ticket.id}`)
+  })
+  it('does not let another ticket result failure clear an unconfirmed cleanup failure', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const two = await h.acceptedTicket(feishu('5', '@bot 修二'))
+    const first = h.runtime.store.tickets.get(one.ticket.id)!, second = h.runtime.store.tickets.get(two.ticket.id)!
+    h.subagents.service.stopDescendants.mockRejectedValueOnce(new Error('first tree remains unconfirmed'))
+      .mockRejectedValueOnce(Object.assign(new Error('second result unavailable'), { code: 'ACTIVATION_RESULT_FAILED' }))
+    h.runtime.executor.stop(first, latestAssignment(first)!, 'stop first')
+    await vi.waitFor(() => expect(h.runtime.health.worker?.detail).toContain('first tree remains unconfirmed'))
+    h.runtime.executor.stop(second, latestAssignment(second)!, 'stop second')
+    await vi.waitFor(() => expect(h.runtime.health.worker?.detail).toContain('second result unavailable'))
+    expect(h.runtime.health.worker?.detail).toContain(`cleanup:${one.ticket.id}`)
+    expect(h.runtime.health.worker?.detail).toContain('first tree remains unconfirmed')
+    expect(h.runtime.health.worker?.detail).not.toContain(`cleanup:${two.ticket.id}`)
+    h.runtime.executor.stop(first, latestAssignment(first)!, 'confirmed cleanup retry')
+    await vi.waitFor(() => expect(h.runtime.health.worker?.detail).not.toContain(`cleanup:${one.ticket.id}`))
+    expect(h.runtime.health.worker?.detail).toContain('second result unavailable')
+  })
+  it('retains a concurrent cleanup rejection when a newer stop has only a result failure', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const ticket = h.runtime.store.tickets.get(one.ticket.id)!, assignment = latestAssignment(ticket)!, cleanup = deferred()
+    h.subagents.service.stopDescendants.mockImplementationOnce(async () => { await cleanup.promise })
+      .mockRejectedValueOnce(Object.assign(new Error('newer result unavailable'), { code: 'ACTIVATION_RESULT_FAILED' }))
+    h.runtime.executor.stop(ticket, assignment, 'first cleanup')
+    await vi.waitFor(() => expect(h.subagents.service.stopDescendants).toHaveBeenCalledTimes(1))
+    h.runtime.executor.stop(ticket, assignment, 'second cleanup')
+    await vi.waitFor(() => expect(h.runtime.health.worker?.detail).toContain('newer result unavailable'))
+    cleanup.reject(new Error('older cleanup remains unconfirmed'))
+    await vi.waitFor(() => expect(h.runtime.health.worker?.detail).toContain('older cleanup remains unconfirmed'))
+    expect(h.runtime.health.worker?.detail).toContain('newer result unavailable')
+    expect(h.runtime.health.worker?.detail).toContain(`cleanup:${one.ticket.id}`)
+  })
+  it('completes shutdown with released-resource result diagnostics still visible', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    h.subagents.service.stopDescendants.mockRejectedValueOnce(Object.assign(new Error('shutdown result unavailable'), { code: 'ACTIVATION_RESULT_FAILED' }))
+    await expect(h.runtime.executor.shutdown()).resolves.toBeUndefined()
+    expect(h.runtime.health.worker?.detail).toContain(`result:${one.ticket.id}`)
+    expect(h.runtime.health.worker?.detail).not.toContain(`cleanup:${one.ticket.id}`)
+    expect(h.runtime.health.worker?.detail).toContain('shutdown result unavailable')
+  })
+  it('retains both shutdown cleanup failure and another worker result diagnostic', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const two = await h.acceptedTicket(feishu('5', '@bot 修二'))
+    const stop = async (parents: readonly { id: string }[]) => {
+      if (parents[0]?.id === one.sessionId) throw new Error('shutdown resource remains unconfirmed')
+      throw Object.assign(new Error('shutdown other result unavailable'), { code: 'ACTIVATION_RESULT_FAILED' })
+    }
+    h.subagents.service.stopDescendants.mockImplementationOnce(stop).mockImplementationOnce(stop)
+    await expect(h.runtime.executor.shutdown()).rejects.toThrow('shutdown failed')
+    expect(h.runtime.health.worker?.detail).toContain('shutdown:')
+    expect(h.runtime.health.worker?.detail).toContain(`result:${two.ticket.id}`)
+    expect(h.runtime.health.worker?.detail).toContain('shutdown resource remains unconfirmed')
+    expect(h.runtime.health.worker?.detail).toContain('shutdown other result unavailable')
+  })
+  it('reports worker shutdown cleanup failures rather than returning success', async () => {
+    await h.acceptedTicket(feishu('1', '@bot 修一'))
+    h.subagents.service.stopDescendants.mockRejectedValueOnce(new Error('shutdown child failed'))
+    await expect(h.runtime.executor.shutdown()).rejects.toThrow('shutdown failed')
+    expect(h.runtime.health.worker).toMatchObject({ state: 'error', detail: expect.stringContaining('shutdown child failed') })
+  })
   it('stops every worker\'s jobs and subagents when dsh-superagent stops, before it releases their tool limits', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     const job = h.jobs.run(one.sessionId), child = h.subagents.spawn(one.sessionId)
@@ -577,7 +962,54 @@ describe('a worker whose work runs in the background', () => {
     expect(h.jobs.service.kill).toHaveBeenCalledWith(job, one.sessionId, expect.any(String))
     expect(h.subagents.live(child)).toBe(false)
   })
-  it('cancels no worker for a subagent that ended before, and cancels the turn a release woke also when the release fails', async () => {
+  it('recovers an idle observation only after the same ticket completes a valid quiet check', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot idle recovery'))
+    const agent = h.agents.get(one.sessionId)!
+    h.subagents.service.waitForTreeWork.mockRejectedValueOnce(new Error('idle tree observation failed'))
+    idle(one.sessionId)
+    await vi.waitFor(() => expect(h.runtime.health.worker?.detail).toContain(`idle:${one.ticket.id}`))
+    const two = await h.acceptedTicket(feishu('5', '@bot other idle'))
+    idle(two.sessionId); await h.runtime.idle()
+    expect(h.runtime.health.worker?.detail).toContain('idle tree observation failed')
+    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'blocked', summary: 'Need input' })
+    idle(one.sessionId); await h.runtime.idle()
+    expect(h.runtime.health.worker?.detail).toContain('idle tree observation failed')
+    h.runtime.receive(feishu('2', '继续', { mentions: [], root_id: 'om_1' })); await h.runtime.idle()
+    expect(h.agents.get(one.sessionId)).toBe(agent)
+    idle(one.sessionId)
+    await vi.waitFor(() => expect(h.runtime.health.worker?.state).toBe('ready'))
+    expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)?.report?.state).toBe('waiting')
+  })
+  it('does not clear an idle failure when a later observation returns because the worker runs again', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot interrupted idle'))
+    const agent = h.agents.get(one.sessionId)!
+    h.subagents.service.waitForTreeWork.mockRejectedValueOnce(new Error('first idle check failed'))
+    idle(one.sessionId)
+    await vi.waitFor(() => expect(h.runtime.health.worker?.detail).toContain('first idle check failed'))
+    h.subagents.service.waitForTreeWork.mockImplementationOnce(async () => { agent.status = 'running'; return false })
+    idle(one.sessionId); await h.runtime.idle()
+    expect(h.runtime.health.worker?.detail).toContain('first idle check failed')
+    idle(one.sessionId)
+    await vi.waitFor(() => expect(h.runtime.health.worker?.state).toBe('ready'))
+  })
+  it('keeps cleanup failure across unrelated events and recovers only after that ticket is cleaned again', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const agent = h.agents.get(one.sessionId)!
+    h.subagents.spawn(one.sessionId)
+    h.subagents.service.stopDescendants.mockImplementationOnce(async () => { throw new Error('specific child cleanup failed') })
+    await h.runTool(one.sessionId, 'orchestrator_report', { state: 'blocked', summary: 'Need input' })
+    idle(one.sessionId)
+    await vi.waitFor(() => expect(h.runtime.health.worker).toMatchObject({ state: 'error', detail: expect.stringContaining('specific child cleanup failed') }))
+    const two = await h.acceptedTicket(feishu('5', '@bot 修二'))
+    idle(two.sessionId); await h.runtime.idle()
+    expect(h.runtime.health.worker?.state).toBe('error')
+    h.runtime.engine.retryTicket(one.ticket.id)
+    await h.runtime.idle()
+    await vi.waitFor(() => expect(h.runtime.health.worker?.state).toBe('ready'))
+    expect(h.agents.get(one.sessionId)).toBe(agent)
+    expect(() => h.subagents.spawn(one.sessionId)).not.toThrow()
+  })
+  it('cancels no worker for a subagent that ended before, and retains a failed release', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     const agent = h.agents.get(one.sessionId)!
     h.subagents.settle(h.subagents.spawn(one.sessionId))
@@ -589,10 +1021,10 @@ describe('a worker whose work runs in the background', () => {
     const two = await h.acceptedTicket(feishu('5', '@bot 修二'))
     const other = h.agents.get(two.sessionId)!
     const child = h.subagents.spawn(two.sessionId)
-    h.subagents.service.drainChildren.mockImplementationOnce(async () => { h.subagents.settle(child); throw new Error('ACTIVATION_TEARDOWN_FAILED') })
+    h.subagents.service.stopDescendants.mockImplementationOnce(async () => { h.subagents.settle(child, false); throw new Error('ACTIVATION_TEARDOWN_FAILED') })
     h.runtime.engine.stopTicket(two.ticket.id)
-    await vi.waitFor(() => expect(h.subagents.service.drainChildren).toHaveBeenCalled())
-    await vi.waitFor(() => expect(other.cancel.mock.invocationCallOrder.at(-1)).toBeGreaterThan(h.subagents.service.drainChildren.mock.invocationCallOrder.at(-1)!))
+    await vi.waitFor(() => expect(h.runtime.health.worker).toMatchObject({ state: 'error', detail: expect.stringContaining('ACTIVATION_TEARDOWN_FAILED') }))
+    expect(other.cancel).toHaveBeenCalledWith({ kind: 'user' }, { keepInbox: false })
   })
   it('stops the jobs and the turn of a worker a restart in this process left running, before its Assignment starts again', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
@@ -608,12 +1040,8 @@ describe('a worker whose work runs in the background', () => {
     await h.acceptedTicket(feishu('1', '@bot 修一'))
     const queued = await h.acceptedTicket(feishu('5', '@bot 修二'))
     expect(h.agents.has(queued.sessionId)).toBe(false)
-    // DSH cannot list the children of a Session that does not exist.
-    const list = h.subagents.service.listChildren.getMockImplementation()!
-    h.subagents.service.listChildren.mockImplementation(async (id: string) => {
-      if (id === queued.sessionId) throw new Error('SESSION_QUERY_SESSION_NOT_FOUND')
-      return list(id)
-    })
+    // No loaded worker means there is no root tree to stop.
+    h.subagents.service.stopDescendants.mockClear()
     h.runtime.engine.stopTicket(queued.ticket.id); await h.runtime.idle()
     await new Promise(resolve => setTimeout(resolve, 10))
     expect(h.runtime.health.worker?.state).not.toBe('error')

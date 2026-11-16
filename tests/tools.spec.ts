@@ -295,7 +295,7 @@ it('releases the tools it registered for a Session once its agent is disposed, a
   const worker = `worker-${ticket.id}`
   expect(h.tools.get(worker)!.size).toBeGreaterThan(0)
   h.ctx.emit('agent/disposed', { agent: h.agents.get(worker) } as never)
-  expect([h.tools.get(worker)!.size, h.tools.get(h.runtime.masterId)!.size > 0]).toEqual([0, true])
+  await vi.waitFor(() => expect([h.tools.get(worker)!.size, h.tools.get(h.runtime.masterId)!.size > 0]).toEqual([0, true]))
   // Releasing again, as at shutdown, finds nothing left of it.
   h.ctx.emit('agent/disposed', { agent: h.agents.get(worker) } as never)
   expect(h.tools.get(worker)!.size).toBe(0)

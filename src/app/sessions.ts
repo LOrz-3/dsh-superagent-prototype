@@ -42,7 +42,7 @@ export interface SessionsHost {
  * What Sessions registered for an agent it decorated: the releases of its prompt section, tools and skill scope, the scope
  * its skills are registered in, and the skills of one prompt revision; for a worker's subagent, only its tool limits.
  */
-interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true }
+interface SessionBinding { disposers: (() => unknown)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true }
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
@@ -94,6 +94,9 @@ export class Sessions {
   private readonly agentDelivery: AgentDelivery
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
+  private readonly guards = new Map<Agent, () => unknown>()
+  private readonly guardFailures = new Map<Agent, unknown>()
+  private readonly applicationDisposers: (() => unknown)[] = []
   private readonly retryHealth = new RetryHealth()
   private readonly ctx: Context
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
@@ -107,32 +110,30 @@ export class Sessions {
   /** Subscribes to host agent and session events so newly created sessions are decorated and model-budget retries are reflected in health. Call once at startup. */
   install(): void {
     const ctx = this.ctx
-    ctx.on('agent/disposed', ({ agent }) => {
-      this.release(agent)
+    this.applicationDisposers.push(ctx.on('agent/disposed', ({ agent }) => {
+      void this.release(agent).catch((error: unknown) => { this.ctx.logger.warn('dsh-superagent Session registrations remain unreleased: %s', String(error)) })
       this.retryHealth.clear(agent.id); this.updateModelHealth()
-    })
-    ctx.on('session/event', (session, event) => {
-      const agent = ctx.agents.get(session.id)
+    }), ctx.on('session/event', (session, event) => {
+      const agent = ctx.get('agents')!.get(session.id)
       const binding = agent && agent.session === session ? this.bindings.get(agent) : undefined
       if (!agent || !binding || binding.subagent) return
       this.retryHealth.observe(agent.id, event)
       this.updateModelHealth()
-    })
-    ctx.on('agent/created', async ({ agent }) => { await this.decorate(agent); return undefined })
-    // Opening a Session in DSH's Web UI before its first turn may select the default preset for it: select ours again. After
-    // its first turn DSH refuses any selection, which leaves it as it is.
-    ctx.inject(['agentPresets'], child => {
+    }), ctx.on('agent/created', async ({ agent }) => { await this.decorate(agent); return undefined }))
+    // Preset selection is application-owned; it must not consult a stopped application's Store.
+    const presetsScope = ctx.inject(['agentPresets'], child => {
       child.on('agent-preset/selected', (sessionId, preset) => {
-        const ticketId = ticketOfSession(sessionId), agent = ctx.agents.get(sessionId as SessionId)
+        if (this.host.closing()) return
+        const ticketId = ticketOfSession(sessionId), agent = ctx.get('agents')!.get(sessionId as SessionId)
         const ours = sessionId === this.host.masterId ? ROUTER_PRESET : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
         if (!ours || preset === ours || !agent) return
         const presets = child.get('agentPresets') as { select(agent: Agent, preset: string): Promise<string> }
         presets.select(agent, ours).catch(() => {})
       })
     })
-    ctx.on('agent/status', ({ agent, status }) => {
+    this.applicationDisposers.push(() => presetsScope.dispose(), ctx.on('agent/status', ({ agent, status }) => {
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
-    })
+    }))
   }
   /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
   async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
@@ -230,6 +231,12 @@ export class Sessions {
     return ticketId === undefined ? undefined : this.host.store.tickets.get(ticketId)
   }
   private async decorate(agent: Agent): Promise<void> {
+    if (this.host.closing()) {
+      if (!this.guards.has(agent) && (agent.id === this.host.masterId || ticketOfSession(agent.id) !== undefined)) {
+        this.ownGuard(agent, agent.ctx.tools.guard(() => 'dsh-superagent is stopping; new work is not admitted'))
+      }
+      return
+    }
     if (this.bindings.has(agent)) return
     const host = this.host
     const master = agent.id === host.masterId
@@ -253,15 +260,16 @@ export class Sessions {
       binding.skills = undefined
       this.bindSkills(binding, host.prompts.current())
     })
-    binding.disposers.push(() => { skillScope.dispose().catch((error: unknown) => { this.ctx.logger.warn('dsh-superagent could not release a skill scope: %s', String(error)) }) })
+    binding.disposers.push(() => skillScope.dispose())
     await skillScope
     // Bail out if the agent was disposed while awaiting the skill scope.
     if (this.bindings.get(agent) !== binding) return
     const register = this.registerTool(agent, binding)
     for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
-      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
-        agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
+      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }))
+      this.ownGuard(agent, agent.ctx.tools.guard(execution => this.host.closing()
+        ? 'dsh-superagent is stopping; new work is not admitted' : noWait(execution, () => this.routed(agent))))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
       binding.disposers.push(...this.workOnly(agent, ticket!.id))
@@ -286,14 +294,28 @@ export class Sessions {
    * (see the executor). Read inherited tools through the parent scope, which includes the preset's tools. The global view
    * misses preset tools; the agent's own view also includes local tools such as subagent, which restrict refuses to name.
    */
-  private workOnly(agent: Agent, ticketId: string): (() => void)[] {
+  private workOnly(agent: Agent, ticketId: string): (() => unknown)[] {
     const store = this.host.store
     const parent = scopeParentOf(agent)
     const allow = WORK_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
-    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
+    this.ownGuard(agent, agent.ctx.tools.guard(() => {
+      if (this.host.closing()) return 'dsh-superagent is stopping; new work is not admitted'
       const current = store.tickets.get(ticketId)
       return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
-    })]
+    }))
+    return [agent.ctx.tools.restrict({ allow })]
+  }
+  /** The registration belongs to agent.ctx, so unloading the application fiber does not remove it. */
+  private ownGuard(agent: Agent, releaseTool: () => unknown): void {
+    const releaseStep = agent.ctx.on('agent/pre-step', async (_event, next) => this.host.closing() ? { kind: 'reject' } : next())
+    let disposal: Promise<void> | undefined
+    const release = () => disposal ??= (async () => {
+      const results = await Promise.allSettled([Promise.resolve().then(releaseTool), Promise.resolve().then(releaseStep)])
+      const failures = results.flatMap(result => result.status === 'rejected' ? [result.reason] : [])
+      if (failures.length) throw new AggregateError(failures, 'Agent admission guards could not be released')
+    })()
+    this.guards.set(agent, release)
+    agent.ctx.effect(() => () => { if (this.guards.get(agent) === release) this.guards.delete(agent) }, 'dsh-superagent guard ownership')
   }
   /**
    * A subagent of an Executor Session, or of one of its subagents, which runs under DSH's `standard` preset with the worker's
@@ -337,16 +359,58 @@ export class Sessions {
     if (revisions.at(-1) !== version.revision) store.set(KV.sessions.prompts(agent.id), bound)
     return version
   }
-  /** Releases registrations for `agent` in reverse order (LIFO); disposing its skill scope releases its skills as well. */
-  private release(agent: Agent): void {
-    const binding = this.bindings.get(agent)
-    if (!binding) return
-    this.bindings.delete(agent)
-    binding.skills?.dispose()
-    for (const dispose of binding.disposers.splice(0).reverse()) {
-      try { dispose() } catch (error) { this.ctx.logger.warn('dsh-superagent could not release what it registered for a Session: %s', String(error)) }
+  /** Release each registration independently, retaining rejected callbacks for a real later attempt. */
+  private async release(agent: Agent, keepGuard = false): Promise<void> {
+    const binding = this.bindings.get(agent), failures: unknown[] = []
+    if (binding) {
+      if (binding.skills) {
+        try { binding.skills.dispose(); binding.skills = undefined }
+        catch (error: unknown) { failures.push(error) }
+      }
+      for (const dispose of [...binding.disposers].reverse()) {
+        try {
+          await dispose()
+          const index = binding.disposers.indexOf(dispose)
+          if (index !== -1) binding.disposers.splice(index, 1)
+        } catch (error: unknown) { failures.push(error) }
+      }
+      if (!binding.skills && !binding.disposers.length) this.bindings.delete(agent)
     }
+    if (!keepGuard) {
+      const release = this.guards.get(agent)
+      if (this.guardFailures.has(agent)) failures.push(this.guardFailures.get(agent))
+      else if (release) {
+        try { await release(); if (this.guards.get(agent) === release) this.guards.delete(agent) }
+        catch (error: unknown) { this.guardFailures.set(agent, error); failures.push(error) }
+      }
+    }
+    if (failures.length) throw new AggregateError(failures, `Session registrations of ${agent.id} could not be released`)
   }
-  /** Releases prompt sections, skills, and tools registered by `Sessions` across all decorated agents. */
-  dispose(): void { for (const agent of [...this.bindings.keys()]) this.release(agent) }
+  /** Unbind prompts, skills and tools; keep guards until Runtime confirms Store closure when requested. */
+  async dispose(keepGuards = false): Promise<void> {
+    const failures: unknown[] = []
+    for (const dispose of [...this.applicationDisposers].reverse()) {
+      try {
+        await dispose()
+        const index = this.applicationDisposers.indexOf(dispose)
+        if (index !== -1) this.applicationDisposers.splice(index, 1)
+      } catch (error: unknown) { failures.push(error) }
+    }
+    const results = await Promise.allSettled([...this.bindings.keys()].map(agent => this.release(agent, keepGuards)))
+    failures.push(...results.flatMap(result => result.status === 'rejected' ? [result.reason] : []))
+    if (!keepGuards) {
+      try { await this.releaseGuards() } catch (error: unknown) { failures.push(error) }
+    }
+    if (failures.length) throw new AggregateError(failures, 'Session cleanup failed')
+  }
+  /** Release retained Agent-owned guards only after no callback can access a live application Store. */
+  async releaseGuards(): Promise<void> {
+    const failures: unknown[] = [...this.guardFailures.values()]
+    for (const [agent, release] of [...this.guards]) {
+      if (this.guardFailures.has(agent)) continue
+      try { await release(); if (this.guards.get(agent) === release) this.guards.delete(agent) }
+      catch (error: unknown) { this.guardFailures.set(agent, error); failures.push(error) }
+    }
+    if (failures.length) throw new AggregateError(failures, 'Session guards could not be released')
+  }
 }

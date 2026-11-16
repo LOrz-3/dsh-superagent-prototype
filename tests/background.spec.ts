@@ -2,17 +2,19 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { expect, it, vi } from 'vitest'
-import { stopSubagents, untilQuiet } from '../src/executor/background.ts'
+import { killJobs, stopBackground, stopSubagents, untilQuiet } from '../src/executor/background.ts'
 import { jobRegistry } from './fixtures/host.ts'
+import { stopFailureParts } from '../src/executor/stop-failure.ts'
 
 /** A context with DSH's job registry and subagents, and an idle worker agent with one live subagent, `child-1`. */
-function setup(waitForChildren: (agent: Agent) => Promise<boolean>, drainChildren: () => Promise<void> = async () => {}) {
+function setup(waitForTreeWork: (agent: Agent) => Promise<boolean>, drainChildren: () => Promise<void> = async () => {}) {
   const jobs = jobRegistry()
   const agent = { id: 'worker-t1', status: 'idle', whenIdle: async () => {}, inbox: { nextTurn: [], nextStep: [] }, cancel: vi.fn() } as unknown as
     Agent & { status: string; cancel: ReturnType<typeof vi.fn> }
-  const subagents = { waitForChildren: vi.fn(waitForChildren), listChildren: async () => [{ id: 'child-1' }], drainChildren: vi.fn(drainChildren) }
-  const services: Record<string, unknown> = { jobs: jobs.service, subagents }
-  const ctx = { get: (name: string) => services[name], agents: { get: () => agent } } as unknown as Context
+  const subagents = { waitForTreeWork: vi.fn(waitForTreeWork), stopDescendants: vi.fn(drainChildren) }
+  const agents = { get: () => agent }
+  const services: Record<string, unknown> = { jobs: jobs.service, subagents, agents }
+  const ctx = { get: (name: string) => services[name], agents } as unknown as Context
   return { ctx, agent, jobs, subagents }
 }
 
@@ -59,19 +61,77 @@ it('joins a worker\'s subagents once for the looks that wait on them, as DSH can
     stop.abort()
     expect(await quiet).toBe(false)
   }
-  expect(subagents.waitForChildren).toHaveBeenCalledTimes(1)
+  expect(subagents.waitForTreeWork).toHaveBeenCalledTimes(1)
 })
 
-it('gives up a release of subagents that does not end within 10 seconds, and cancels the turn their ends woke', async () => {
+it('reports a release timeout as failure without cancelling the root turn', async () => {
   const { ctx, agent } = setup(async () => false, () => new Promise(() => {}))
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
   try {
-    let stopped = false
-    const stopping = stopSubagents(ctx, agent).then(() => { stopped = true })
-    await vi.advanceTimersByTimeAsync(9_999)
-    expect(stopped).toBe(false)
-    await vi.advanceTimersByTimeAsync(1)
+    const stopping = expect(stopSubagents(ctx, agent)).rejects.toThrow('timed out')
+    await vi.advanceTimersByTimeAsync(10_000)
     await stopping
   } finally { vi.useRealTimers() }
-  expect(agent.cancel).toHaveBeenCalledWith({ kind: 'user' }, { keepInbox: false })
+  expect(agent.cancel).not.toHaveBeenCalled()
+})
+
+it('stops through the runtime barrier even with no catalog rows, and preserves the exact root', async () => {
+  const { ctx, agent, subagents } = setup(async () => false)
+  await stopSubagents(ctx, agent)
+  expect(subagents.stopDescendants).toHaveBeenCalledWith([agent])
+  expect(agent.cancel).not.toHaveBeenCalled()
+})
+
+it('propagates subtree cleanup errors', async () => {
+  const { ctx, agent } = setup(async () => false, async () => { throw new Error('teardown failed') })
+  await expect(stopSubagents(ctx, agent)).rejects.toThrow('teardown failed')
+})
+
+it('refuses an unmatched runtime instead of falling back to permanent drain', async () => {
+  const drainDescendants = vi.fn()
+  const ctx = { get: () => ({ waitForTreeWork: async () => false, drainDescendants }) } as unknown as Context
+  const agent = { id: 'worker-t1' } as Agent
+  await expect(stopSubagents(ctx, agent)).rejects.toThrow('load the matching lifecycle runtime extension')
+  expect(drainDescendants).not.toHaveBeenCalled()
+})
+
+it('tries every job kill and retains kill, timeout, and wait failures', async () => {
+  const { ctx, agent, jobs } = setup(async () => false)
+  const first = jobs.run(agent.id), second = jobs.run(agent.id)
+  jobs.service.wait.mockResolvedValueOnce({ id: first, owner: agent.id, status: 'running' })
+    .mockRejectedValueOnce(new Error('wait failed'))
+  jobs.service.kill.mockImplementationOnce(() => { throw new Error('kill failed') }).mockImplementationOnce(() => 'requested')
+  const error = await killJobs(ctx, agent.id, 'stop').catch(error => error)
+  expect(error).toBeInstanceOf(AggregateError)
+  expect(error.errors.map((item: Error) => item.message).join('; ')).toMatch(/kill failed/)
+  expect(error.errors.map((item: Error) => item.message).join('; ')).toMatch(/did not stop/)
+  expect(error.errors.map((item: Error) => item.message).join('; ')).toMatch(/wait failed/)
+  expect(jobs.service.kill).toHaveBeenCalledWith(second, agent.id, 'stop')
+})
+
+it('preserves a sole result failure after all background resources were released', async () => {
+  const result = Object.assign(new Error('provider result unavailable'), { code: 'ACTIVATION_RESULT_FAILED' })
+  const { ctx, agent } = setup(async () => false, async () => { throw result })
+  await expect(stopBackground(ctx, agent.id, 'stop')).rejects.toBe(result)
+})
+
+it('retains a job cleanup failure alongside a runtime-confirmed result failure', async () => {
+  const result = Object.assign(new Error('provider result unavailable'), { code: 'ACTIVATION_RESULT_FAILED' })
+  const { ctx, agent, jobs } = setup(async () => false, async () => { throw result })
+  const job = jobs.run(agent.id)
+  jobs.service.wait.mockResolvedValueOnce({ id: job, owner: agent.id, status: 'completed' })
+  jobs.service.kill.mockImplementationOnce(() => { throw new Error('job kill failed') })
+  const failure: unknown = await stopBackground(ctx, agent.id, 'stop').catch(error => error)
+  expect(stopFailureParts(failure).results).toEqual([result])
+  expect(stopFailureParts(failure).cleanup).toHaveLength(1)
+  expect(stopFailureParts(failure).cleanup[0]).toBeInstanceOf(AggregateError)
+})
+
+it('attempts subtree cleanup even when stopping a shell job fails', async () => {
+  const { ctx, agent, jobs, subagents } = setup(async () => false)
+  const job = jobs.run(agent.id)
+  jobs.service.wait.mockResolvedValueOnce({ id: job, owner: agent.id, status: 'completed' })
+  jobs.service.kill.mockImplementationOnce(() => { throw new Error('kill failed') })
+  await expect(stopBackground(ctx, agent.id, 'stop')).rejects.toThrow('Stopping the background work')
+  expect(subagents.stopDescendants).toHaveBeenCalledWith([agent])
 })
